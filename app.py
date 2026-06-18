@@ -93,14 +93,49 @@ def compute_rsi(close: pd.Series, period: int) -> pd.Series:
     return rsi
 
 
-def signal_rsi(df: pd.DataFrame, period: int, oversold: int, overbought: int) -> pd.Series:
-    """RSI가 과매도선 아래로 가면 매수, 과매수선 위로 가면 매도(현금)."""
+def signal_rsi(
+    df: pd.DataFrame, period: int, ma_period: int, oversold: int, overbought: int
+) -> pd.Series:
+    """
+    RSI와 RSI 이동평균선(시그널선)의 교차로 매매.
+    - 매수: RSI가 과매도선(예: 30) 아래인 구간에서 RSI가 이동평균선을 '위로' 돌파할 때
+    - 매도: RSI가 과매수선(예: 70) 위인 구간에서 RSI가 이동평균선을 '아래로' 돌파할 때
+    """
     rsi = compute_rsi(df["Close"], period)
+    rsi_ma = rsi.rolling(ma_period).mean()
+
+    cross_up = (rsi > rsi_ma) & (rsi.shift(1) <= rsi_ma.shift(1))    # RSI가 MA 상향 돌파
+    cross_down = (rsi < rsi_ma) & (rsi.shift(1) >= rsi_ma.shift(1))  # RSI가 MA 하향 돌파
+
+    # "과매도 구간(<30)에 들어갔다가 → 이동평균선을 상향 돌파"하면 매수,
+    # "과매수 구간(>70)에 들어갔다가 → 이동평균선을 하향 돌파"하면 매도.
     pos = pd.Series(np.nan, index=df.index)
-    pos[rsi < oversold] = 1.0   # 과매도 → 매수
-    pos[rsi > overbought] = 0.0  # 과매수 → 청산
+    armed_long = False   # RSI가 과매도 구간에 진입한 적이 있는가
+    armed_short = False  # RSI가 과매수 구간에 진입한 적이 있는가
+
+    for t in df.index:
+        r = rsi.loc[t]
+        if pd.isna(r):
+            continue
+        if r < oversold:
+            armed_long = True
+        if r > overbought:
+            armed_short = True
+        if armed_long and bool(cross_up.loc[t]):
+            pos.loc[t] = 1.0      # 매수
+            armed_long = False
+        elif armed_short and bool(cross_down.loc[t]):
+            pos.loc[t] = 0.0      # 매도(청산)
+            armed_short = False
+
     pos = pos.ffill().fillna(0.0)
     return pos
+
+
+def rsi_with_ma(df: pd.DataFrame, period: int, ma_period: int):
+    """차트 표시용: RSI와 RSI 이동평균선을 함께 반환."""
+    rsi = compute_rsi(df["Close"], period)
+    return rsi, rsi.rolling(ma_period).mean()
 
 
 # ----------------------------------------------------------------------------
@@ -186,8 +221,9 @@ if strategy == "이동평균 교차 (SMA)":
     params["long"] = st.sidebar.slider("장기 이동평균 (일)", 20, 300, 60)
 elif strategy == "RSI":
     params["period"] = st.sidebar.slider("RSI 기간 (일)", 5, 30, 14)
-    params["oversold"] = st.sidebar.slider("과매도 기준 (이하면 매수)", 10, 45, 30)
-    params["overbought"] = st.sidebar.slider("과매수 기준 (이상이면 매도)", 55, 90, 70)
+    params["ma_period"] = st.sidebar.slider("RSI 이동평균선 기간 (일)", 2, 30, 9)
+    params["oversold"] = st.sidebar.slider("과매도 기준 (이 아래에서 상향돌파 시 매수)", 10, 45, 30)
+    params["overbought"] = st.sidebar.slider("과매수 기준 (이 위에서 하향돌파 시 매도)", 55, 90, 70)
 
 st.sidebar.markdown("---")
 fee_bps = st.sidebar.number_input(
@@ -228,7 +264,9 @@ elif strategy == "RSI":
     if params["oversold"] >= params["overbought"]:
         st.error("과매도 기준은 과매수 기준보다 작아야 합니다.")
         st.stop()
-    position = signal_rsi(data, params["period"], params["oversold"], params["overbought"])
+    position = signal_rsi(
+        data, params["period"], params["ma_period"], params["oversold"], params["overbought"]
+    )
 else:
     position = signal_buy_and_hold(data)
 
@@ -253,12 +291,41 @@ st.caption(
     f"이 전략은 그보다 **{diff:+,.1f}%p** {'높습니다 🎉' if diff >= 0 else '낮습니다'}."
 )
 
-# ----- 차트: 가격 + 자산곡선 -----
-fig = make_subplots(
-    rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-    row_heights=[0.55, 0.45],
-    subplot_titles=("가격 & 매매 시점", "자산 곡선 (시작=1.0)"),
+# ----- 전략 vs 매수 후 보유 비교 표 -----
+st.markdown("#### 📊 전략 vs 매수 후 보유 비교")
+
+
+def _fmt(metrics_dict):
+    return [
+        f"{metrics_dict.get('total_return', 0) * 100:,.1f}%",
+        f"{metrics_dict.get('cagr', 0) * 100:,.1f}%",
+        f"{metrics_dict.get('ann_vol', 0) * 100:,.1f}%",
+        f"{metrics_dict.get('sharpe', 0):,.2f}",
+        f"{metrics_dict.get('max_dd', 0) * 100:,.1f}%",
+    ]
+
+
+compare_df = pd.DataFrame(
+    {"내 전략": _fmt(metrics), "매수 후 보유": _fmt(bh_metrics)},
+    index=["총 수익률", "연환산 수익률(CAGR)", "연 변동성", "샤프 지수", "최대 낙폭(MDD)"],
 )
+st.table(compare_df)
+st.caption("※ 변동성과 최대 낙폭은 절댓값이 작을수록, 나머지는 클수록 좋습니다.")
+
+# ----- 차트: 가격 + 자산곡선 (+ RSI 패널) -----
+show_rsi_panel = strategy == "RSI"
+if show_rsi_panel:
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+        row_heights=[0.45, 0.30, 0.25],
+        subplot_titles=("가격 & 매매 시점", "자산 곡선 (시작=1.0)", "RSI & RSI 이동평균선"),
+    )
+else:
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        row_heights=[0.55, 0.45],
+        subplot_titles=("가격 & 매매 시점", "자산 곡선 (시작=1.0)"),
+    )
 
 # 가격
 fig.add_trace(
@@ -293,7 +360,29 @@ fig.add_trace(
     row=2, col=1,
 )
 
-fig.update_layout(height=700, hovermode="x unified", legend=dict(orientation="h"))
+# RSI 패널 (RSI 전략일 때만)
+if show_rsi_panel:
+    rsi_series, rsi_ma_series = rsi_with_ma(data, params["period"], params["ma_period"])
+    fig.add_trace(
+        go.Scatter(x=result.index, y=rsi_series, name="RSI", line=dict(color="#9467bd")),
+        row=3, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=result.index, y=rsi_ma_series, name="RSI 이동평균",
+                   line=dict(color="#ff7f0e", dash="dot")),
+        row=3, col=1,
+    )
+    fig.add_hline(y=params["overbought"], line=dict(color="red", dash="dash"),
+                  opacity=0.5, row=3, col=1)
+    fig.add_hline(y=params["oversold"], line=dict(color="green", dash="dash"),
+                  opacity=0.5, row=3, col=1)
+    fig.update_yaxes(range=[0, 100], row=3, col=1)
+
+fig.update_layout(
+    height=850 if show_rsi_panel else 700,
+    hovermode="x unified",
+    legend=dict(orientation="h"),
+)
 st.plotly_chart(fig, use_container_width=True)
 
 # ----- 거래 횟수 & 데이터 다운로드 -----
