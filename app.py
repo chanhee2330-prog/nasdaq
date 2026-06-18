@@ -9,14 +9,16 @@
 실행:  streamlit run app.py
 """
 
-import datetime as dt
-
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
+
+from engine import (
+    build_position, compute_metrics, map_position, optimize,
+    run_backtest, signal_buy_and_hold, walk_forward,
+)
 
 st.set_page_config(page_title="나스닥/SOXL 백테스팅", page_icon="📈", layout="wide")
 
@@ -62,243 +64,10 @@ def load_data(ticker: str, interval: str, period: str) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# 지표
-# ----------------------------------------------------------------------------
-def compute_rsi(close: pd.Series, period: int) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    ag = gain.ewm(alpha=1 / period, min_periods=period).mean()
-    al = loss.ewm(alpha=1 / period, min_periods=period).mean()
-    rs = ag / al.replace(0.0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def atr(df: pd.DataFrame, n: int) -> pd.Series:
-    h, l, c = df["High"], df["Low"], df["Close"]
-    pc = c.shift(1)
-    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, min_periods=n).mean()
-
-
-def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    h, l, c = df["High"], df["Low"], df["Close"]
-    up = h.diff()
-    dn = -l.diff()
-    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
-    pc = c.shift(1)
-    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    atr_ = tr.ewm(alpha=1 / n, min_periods=n).mean()
-    plus_di = 100 * plus_dm.ewm(alpha=1 / n, min_periods=n).mean() / atr_
-    minus_di = 100 * minus_dm.ewm(alpha=1 / n, min_periods=n).mean() / atr_
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
-    return dx.ewm(alpha=1 / n, min_periods=n).mean()
-
-
-def disparity(close: pd.Series, n: int) -> pd.Series:
-    """이격도 = 현재가 / 이동평균 × 100."""
-    return close / close.rolling(n).mean() * 100
-
-
-# ----------------------------------------------------------------------------
-# 전략 (신호 종목 기준 포지션 1/0 생성)
-# ----------------------------------------------------------------------------
-def signal_buy_and_hold(df):
-    return pd.Series(1.0, index=df.index)
-
-
-def signal_sma_crossover(df, short, long):
-    return (df["Close"].rolling(short).mean() > df["Close"].rolling(long).mean()).astype(float)
-
-
-def signal_sma_price(df, window):
-    return (df["Close"] > df["Close"].rolling(window).mean()).astype(float)
-
-
-def signal_rsi(df, period, ma_period, oversold, overbought):
-    rsi = compute_rsi(df["Close"], period)
-    rma = rsi.rolling(ma_period).mean()
-    cu = ((rsi > rma) & (rsi.shift(1) <= rma.shift(1))).to_numpy()
-    cd = ((rsi < rma) & (rsi.shift(1) >= rma.shift(1))).to_numpy()
-    rv = rsi.to_numpy()
-    pos = np.full(len(rv), np.nan)
-    al = ash = False
-    for i in range(len(rv)):
-        r = rv[i]
-        if np.isnan(r):
-            continue
-        if r < oversold:
-            al = True
-        if r > overbought:
-            ash = True
-        if al and cu[i]:
-            pos[i] = 1.0; al = False
-        elif ash and cd[i]:
-            pos[i] = 0.0; ash = False
-    return pd.Series(pos, index=df.index).ffill().fillna(0.0)
-
-
-def signal_breakout_trail(df, donchian_n, atr_n, atr_k,
-                          use_adx=False, adx_min=20, use_disp=False,
-                          disp_cap=115, disp_n=20):
-    """돈치안 돌파 진입 + ATR 트레일링 스톱 청산 (+ADX/이격도 진입 필터).
-    오르는 동안은 계속 보유하고, 고점 대비 ATR×k 만큼 밀릴 때만 청산."""
-    upper = df["High"].rolling(donchian_n).max().shift(1)  # 직전 N봉 고가
-    a = atr(df, atr_n)
-    adx_v = adx(df) if use_adx else None
-    disp_v = disparity(df["Close"], disp_n) if use_disp else None
-
-    c = df["Close"].to_numpy()
-    up = upper.to_numpy()
-    av = a.to_numpy()
-    adxv = adx_v.to_numpy() if use_adx else None
-    dv = disp_v.to_numpy() if use_disp else None
-
-    n = len(c)
-    pos = np.zeros(n)
-    in_pos = False
-    peak = 0.0
-    for i in range(n):
-        if not in_pos:
-            enter = (not np.isnan(up[i])) and c[i] > up[i] and not np.isnan(av[i])
-            if enter and use_adx and (np.isnan(adxv[i]) or adxv[i] < adx_min):
-                enter = False
-            if enter and use_disp and (not np.isnan(dv[i]) and dv[i] > disp_cap):
-                enter = False
-            if enter:
-                in_pos = True
-                peak = c[i]
-                pos[i] = 1.0
-        else:
-            peak = max(peak, c[i])
-            stop = peak - atr_k * av[i] if not np.isnan(av[i]) else -np.inf
-            if c[i] < stop:
-                in_pos = False
-                pos[i] = 0.0
-            else:
-                pos[i] = 1.0
-    return pd.Series(pos, index=df.index)
-
-
-def build_position(df, spec):
-    t = spec["type"]
-    if t == "SMA교차":
-        return signal_sma_crossover(df, spec["short"], spec["long"])
-    if t == "추세추종(MA)":
-        return signal_sma_price(df, spec["window"])
-    if t == "RSI":
-        return signal_rsi(df, spec["period"], spec["ma_period"], spec["oversold"], spec["overbought"])
-    if t == "돌파+트레일":
-        return signal_breakout_trail(
-            df, spec["donchian_n"], spec["atr_n"], spec["atr_k"],
-            spec.get("use_adx", False), spec.get("adx_min", 20),
-            spec.get("use_disp", False), spec.get("disp_cap", 115), spec.get("disp_n", 20))
-    return signal_buy_and_hold(df)
-
-
-def spec_label(spec):
-    t = spec["type"]
-    if t == "SMA교차":
-        return f"SMA교차(단기{spec['short']}/장기{spec['long']})"
-    if t == "추세추종(MA)":
-        return f"추세추종(MA{spec['window']})"
-    if t == "RSI":
-        return f"RSI({spec['period']},MA{spec['ma_period']},{spec['oversold']}/{spec['overbought']})"
-    if t == "돌파+트레일":
-        flt = []
-        if spec.get("use_adx"):
-            flt.append(f"ADX≥{spec['adx_min']}")
-        if spec.get("use_disp"):
-            flt.append(f"이격도≤{spec['disp_cap']}")
-        ftxt = (" +" + "/".join(flt)) if flt else ""
-        return f"돌파{spec['donchian_n']}+트레일(ATR{spec['atr_n']}×{spec['atr_k']}){ftxt}"
-    return "매수 후 보유"
-
-
-# ----------------------------------------------------------------------------
-# 신호 → 거래 종목 정렬 + 백테스트
-# ----------------------------------------------------------------------------
-def map_position(pos_signal: pd.Series, trade_index: pd.Index) -> pd.Series:
-    """신호 종목에서 만든 포지션을 거래 종목 시점에 'as-of'(직전 신호 유지)로 매핑."""
-    s = pos_signal[~pos_signal.index.duplicated(keep="last")].sort_index()
-    union = s.index.union(trade_index)
-    return s.reindex(union).ffill().reindex(trade_index).fillna(0.0)
-
-
-def run_backtest(trade_df, position, fee_bps=0.0):
-    out = pd.DataFrame(index=trade_df.index)
-    out["Close"] = trade_df["Close"]
-    out["DailyReturn"] = trade_df["Close"].pct_change().fillna(0.0)
-    pos = position.reindex(trade_df.index).fillna(0.0)
-    pos_exec = pos.shift(1).fillna(0.0)  # 한 봉 지연 체결
-    out["Position"] = pos_exec
-    trades = pos_exec.diff().abs().fillna(0.0)
-    fee = trades * (fee_bps / 10_000.0)
-    out["StrategyReturn"] = out["DailyReturn"] * pos_exec - fee
-    out["StrategyEquity"] = (1 + out["StrategyReturn"]).cumprod()
-    out["BuyHoldEquity"] = (1 + out["DailyReturn"]).cumprod()
-    out["Trade"] = trades
-    return out
-
-
-def compute_metrics(equity, returns, ppy):
-    if equity.empty or len(equity) < 2:
-        return {}
-    total_return = equity.iloc[-1] - 1
-    days = (equity.index[-1] - equity.index[0]).days or 1
-    years = days / 365.25
-    cagr = equity.iloc[-1] ** (1 / years) - 1 if (years > 0 and equity.iloc[-1] > 0) else np.nan
-    ann_vol = returns.std() * np.sqrt(ppy)
-    sharpe = (returns.mean() * ppy) / ann_vol if ann_vol and ann_vol > 0 else np.nan
-    max_dd = (equity / equity.cummax() - 1).min()
-    return {"total_return": total_return, "cagr": cagr, "ann_vol": ann_vol,
-            "sharpe": sharpe, "max_dd": max_dd}
-
-
-# ----------------------------------------------------------------------------
-# 옵티마이저
-# ----------------------------------------------------------------------------
-def strategy_grid():
-    specs = []
-    for dn in (20, 40, 55):
-        for k in (2.0, 3.0):
-            specs.append({"type": "돌파+트레일", "donchian_n": dn, "atr_n": 14, "atr_k": k})
-            specs.append({"type": "돌파+트레일", "donchian_n": dn, "atr_n": 14, "atr_k": k,
-                          "use_adx": True, "adx_min": 20})
-    for w in (20, 50, 100, 200):
-        specs.append({"type": "추세추종(MA)", "window": w})
-    for s in (10, 20, 30):
-        for l in (50, 100, 200):
-            specs.append({"type": "SMA교차", "short": s, "long": l})
-    for (p, m, ov, ob) in [(14, 9, 30, 70), (14, 5, 35, 65)]:
-        specs.append({"type": "RSI", "period": p, "ma_period": m, "oversold": ov, "overbought": ob})
-    return specs
-
-
-def optimize(signal_df, trade_df, ppy, fee_bps, sort_key):
-    rows = []
-    for spec in strategy_grid():
-        pos_sig = build_position(signal_df, spec)
-        pos = map_position(pos_sig, trade_df.index)
-        res = run_backtest(trade_df, pos, fee_bps)
-        m = compute_metrics(res["StrategyEquity"], res["StrategyReturn"], ppy)
-        if not m:
-            continue
-        rows.append({"전략종류": spec["type"], "파라미터": spec_label(spec),
-                     "총수익률": m["total_return"], "CAGR": m["cagr"], "샤프": m["sharpe"],
-                     "MDD": m["max_dd"], "매매횟수": int((res["Trade"] > 0).sum()), "_spec": spec})
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    return out.sort_values(sort_key, ascending=False).reset_index(drop=True)
-
-
-# ----------------------------------------------------------------------------
 # 사이드바
 # ----------------------------------------------------------------------------
 st.sidebar.header("⚙️ 설정")
-mode = st.sidebar.radio("모드", ["🔍 전략 자동 탐색", "📊 단일 전략 백테스트"])
+mode = st.sidebar.radio("모드", ["🔍 전략 자동 탐색", "🔬 워크포워드 검증", "📊 단일 전략 백테스트"])
 
 st.sidebar.markdown("**종목**")
 sig_label = st.sidebar.selectbox("신호 종목 (추세 판단)", list(SIGNAL_TICKERS.keys()), index=0)
@@ -344,6 +113,10 @@ if mode == "📊 단일 전략 백테스트":
         sp["ma_period"] = st.sidebar.slider("RSI 이동평균", 2, 30, 9)
         sp["oversold"] = st.sidebar.slider("과매도", 10, 45, 30)
         sp["overbought"] = st.sidebar.slider("과매수", 55, 90, 70)
+elif mode == "🔬 워크포워드 검증":
+    sort_key = st.sidebar.selectbox("최적화 기준(학습 구간)", ["CAGR", "총수익률", "샤프"], index=0)
+    train_years = st.sidebar.number_input("학습 기간 (년)", 0.5, 20.0, 3.0, 0.5)
+    test_years = st.sidebar.number_input("검증 기간 (년)", 0.25, 5.0, 1.0, 0.25)
 else:
     sort_key = st.sidebar.selectbox("순위 기준", ["CAGR", "총수익률", "샤프"], index=0)
 
@@ -439,6 +212,71 @@ if mode == "🔍 전략 자동 탐색":
                       title=f"최고 전략 vs 보유 ({trade_ticker}, 자산곡선 로그스케일)",
                       yaxis_type="log")
     st.plotly_chart(fig, use_container_width=True)
+    st.stop()
+
+
+# ============================ 워크포워드 검증 ==============================
+if mode == "🔬 워크포워드 검증":
+    st.subheader(f"🔬 워크포워드 검증 — {hdr}")
+    st.caption(f"기간: {period_txt} · 봉: {interval_label}")
+    train_bars = max(30, int(train_years * ppy))
+    test_bars = max(10, int(test_years * ppy))
+
+    if len(trade_df) < train_bars + test_bars:
+        st.error(f"데이터가 부족합니다. 현재 {len(trade_df)}개 봉인데 "
+                 f"학습({train_bars}) + 검증({test_bars}) = {train_bars + test_bars}개가 필요합니다. "
+                 f"학습/검증 기간을 줄이거나, 봉 기준을 일봉/주봉으로 바꿔 보세요.")
+        st.stop()
+
+    prog = st.progress(0.0, text="워크포워드 진행 중... (각 구간마다 전략을 새로 최적화)")
+    wf_ret, folds = walk_forward(signal_df, trade_df, ppy, fee_bps, sort_key, train_bars, test_bars, prog)
+    prog.empty()
+
+    if wf_ret is None or folds is None or folds.empty:
+        st.error("검증할 구간을 만들지 못했습니다. 기간 설정을 조정해 주세요.")
+        st.stop()
+
+    oos_start, oos_end = wf_ret.index[0], wf_ret.index[-1]
+    wf_eq = (1 + wf_ret).cumprod()
+    bh_ret_oos = trade_df["Close"].pct_change().fillna(0.0).loc[oos_start:oos_end]
+    bh_eq_oos = (1 + bh_ret_oos).cumprod()
+    wf_m = compute_metrics(wf_eq, wf_ret, ppy)
+    bh_m = compute_metrics(bh_eq_oos, bh_ret_oos, ppy)
+
+    wins = int((folds["초과"] > 0).sum())
+    st.markdown(f"**검증(미래) 구간: {oos_start.date()} ~ {oos_end.date()} · 총 {len(folds)}개 구간**")
+    if wf_m["total_return"] > bh_m["total_return"]:
+        st.success(f"✅ 워크포워드(과최적화 배제) 결과, 전략이 보유를 이겼습니다. "
+                   f"{len(folds)}개 검증구간 중 **{wins}개**에서 보유 초과.")
+    else:
+        st.warning(f"⚠️ 워크포워드 결과, 전략이 보유에 미치지 못했습니다 "
+                   f"({len(folds)}개 중 {wins}개 구간만 보유 초과). "
+                   f"보유가 강한 급등장 비중이 큰 구간입니다. 최적화 기준을 '샤프'로 바꾸면 "
+                   f"낙폭 대비 효율을 볼 수 있습니다.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("전략 총수익률(검증)", f"{wf_m['total_return'] * 100:,.0f}%",
+              f"{(wf_m['total_return'] - bh_m['total_return']) * 100:+,.0f}%p vs 보유")
+    c2.metric("전략 CAGR", f"{wf_m['cagr'] * 100:,.1f}%")
+    c3.metric("전략 샤프", f"{wf_m['sharpe']:,.2f}", f"보유 {bh_m['sharpe']:,.2f}")
+    c4.metric("전략 MDD", f"{wf_m['max_dd'] * 100:,.0f}%", f"보유 {bh_m['max_dd'] * 100:,.0f}%")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=wf_eq.index, y=wf_eq, name="워크포워드 전략",
+                             line=dict(color="#2ca02c")))
+    fig.add_trace(go.Scatter(x=bh_eq_oos.index, y=bh_eq_oos, name="매수 후 보유",
+                             line=dict(color="#999999", dash="dash")))
+    fig.update_layout(height=460, hovermode="x unified", legend=dict(orientation="h"),
+                      title=f"검증 구간 자산곡선 ({trade_ticker}, 로그스케일)", yaxis_type="log")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### 구간별 결과 (각 구간은 직전 학습기간에서 고른 전략을 처음 적용한 것)")
+    show = folds.copy()
+    for col in ("검증수익률", "보유수익률", "초과"):
+        show[col] = show[col].map(lambda x: f"{x * 100:+,.0f}%")
+    st.dataframe(show, hide_index=True, use_container_width=True)
+    st.caption("※ '선택된 전략'이 구간마다 바뀌면 그만큼 안정적인 단일 전략을 찾기 어렵다는 신호입니다. "
+               "특정 전략이 자주 선택되면 그 전략의 신뢰도가 높다고 볼 수 있습니다.")
     st.stop()
 
 
