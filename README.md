@@ -41,6 +41,30 @@ streamlit run app.py
 
 브라우저에서 자동으로 `http://localhost:8501` 이 열립니다.
 
+## 💻 다른 PC에서 이어서 작업하기
+
+이 저장소만 있으면 어느 PC에서든 그대로 이어갈 수 있습니다. (필요: Git, Python 3.10+)
+
+```powershell
+# 1) GitHub 인증 (private이면 한 번만)
+#   - GitHub CLI 설치 후:  gh auth login   (브라우저 로그인)
+#   - 또는 git clone 시 토큰 입력
+
+# 2) 저장소 클론
+git clone https://github.com/chanhee2330-prog/nasdaq.git
+cd nasdaq
+
+# 3) 환경 설정 (처음 한 번) — 아래 한 줄이면 .venv 생성 + 패키지 설치까지
+./setup.ps1            # Windows PowerShell
+#   (수동: python -m venv .venv ; .venv\Scripts\pip install -r requirements.txt)
+
+# 4) 실행
+.\.venv\Scripts\streamlit.exe run app.py
+```
+
+> `.venv`(가상환경)는 깃에 올리지 않으므로 PC마다 새로 만듭니다 — 위 3단계가 그 역할입니다.
+> 작업 후에는 `git add -A && git commit -m "..." && git push` 로 올려두면 다음 PC에서 이어집니다.
+
 ## 🌐 인터넷에 공개 배포하기 (무료)
 
 1. 이 저장소를 GitHub에 push 합니다.
