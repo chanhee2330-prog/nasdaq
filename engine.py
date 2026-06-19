@@ -49,6 +49,19 @@ def disparity(close: pd.Series, n: int) -> pd.Series:
     return close / close.rolling(n).mean() * 100
 
 
+def synth_leverage_df(base_df: pd.DataFrame, mult: float, annual_cost: float = 0.01) -> pd.DataFrame:
+    """기초자산 일별수익을 mult배(일별 리밸런싱)한 '합성 레버리지' 가격 시리즈.
+    레버리지 ETF가 없던 과거(닷컴·금융위기 등)까지 N배 백테스트를 가능하게 한다.
+    annual_cost: 연 운용보수+차입비용 가정(기본 1%)."""
+    ret = base_df["Close"].pct_change().fillna(0.0)
+    lev = mult * ret - annual_cost / 252.0
+    close = (1 + lev).cumprod()
+    out = pd.DataFrame(index=base_df.index)
+    out["Open"] = out["High"] = out["Low"] = out["Close"] = close
+    out["Volume"] = 0.0
+    return out
+
+
 # ----------------------------------------------------------------------------
 # 전략 (신호 종목 기준 포지션 1/0 생성)
 # ----------------------------------------------------------------------------

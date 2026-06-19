@@ -17,7 +17,7 @@ from plotly.subplots import make_subplots
 
 from engine import (
     build_position, compute_metrics, map_position, optimize,
-    run_backtest, signal_buy_and_hold, walk_forward,
+    run_backtest, signal_buy_and_hold, synth_leverage_df, walk_forward,
 )
 
 st.set_page_config(page_title="나스닥/SOXL 백테스팅", page_icon="📈", layout="wide")
@@ -32,6 +32,7 @@ SIGNAL_TICKERS = {
 }
 # 실제 거래 종목(레버리지 등)
 TRADE_TICKERS = {
+    "합성 레버리지 (신호 지수 ×N, 전체기간)": "__synth__",
     "SOXL (반도체 3배 ↑)": "SOXL",
     "TQQQ (나스닥 3배 ↑)": "TQQQ",
     "QQQ (1배)": "QQQ",
@@ -77,7 +78,11 @@ if signal_ticker == "__custom__":
 
 trd_label = st.sidebar.selectbox("거래 종목 (실제 매매)", list(TRADE_TICKERS.keys()), index=0)
 trade_ticker = TRADE_TICKERS[trd_label]
-if trade_ticker == "__same__":
+synth_mult = None
+if trade_ticker == "__synth__":
+    synth_mult = st.sidebar.slider("합성 레버리지 배수 (×)", 1.0, 3.0, 3.0, 0.5)
+    trade_ticker = f"{signal_ticker}×{synth_mult:g} 합성"
+elif trade_ticker == "__same__":
     trade_ticker = signal_ticker
 elif trade_ticker == "__custom__":
     trade_ticker = st.sidebar.text_input("거래 티커", value="SOXL").strip().upper()
@@ -138,7 +143,10 @@ if not run:
 spin = st.spinner("데이터 불러오는 중...")
 with spin:
     signal_df = load_data(signal_ticker, interval, period)
-    trade_df = load_data(trade_ticker, interval, period)
+    if synth_mult is not None:
+        trade_df = synth_leverage_df(signal_df, synth_mult)  # 신호 지수의 합성 N배
+    else:
+        trade_df = load_data(trade_ticker, interval, period)
 
 if signal_df.empty or len(signal_df) < 60:
     st.error(f"신호 종목 '{signal_ticker}' 데이터를 충분히 불러오지 못했습니다.")
@@ -156,6 +164,11 @@ period_txt = (f"{trade_df.index[0].date()} ~ {trade_df.index[-1].date()} "
               f"({len(trade_df)}개 {interval_label.split()[0]})")
 same_tk = signal_ticker == trade_ticker
 hdr = f"신호 {signal_ticker} → 거래 {trade_ticker}" if not same_tk else f"{trade_ticker}"
+
+if synth_mult is not None:
+    st.info(f"🧪 **합성 레버리지 모드**: '{signal_ticker}' 지수의 일별수익을 {synth_mult:g}배로 "
+            f"시뮬레이션(연 1% 비용 가정)한 가상 종목입니다. 실제 ETF가 없던 과거(닷컴·금융위기)까지 "
+            f"레버리지 백테스트가 가능합니다. 실제 ETF와는 오차가 있을 수 있습니다.")
 
 bh_res = run_backtest(trade_df, signal_buy_and_hold(trade_df), 0.0)
 bh_metrics = compute_metrics(bh_res["BuyHoldEquity"], bh_res["DailyReturn"], ppy)
