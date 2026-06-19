@@ -73,8 +73,27 @@ def signal_sma_crossover(df, short, long):
     return (df["Close"].rolling(short).mean() > df["Close"].rolling(long).mean()).astype(float)
 
 
-def signal_sma_price(df, window):
-    return (df["Close"] > df["Close"].rolling(window).mean()).astype(float)
+def signal_sma_price(df, window, buffer=0.0):
+    """종가 > 이동평균이면 보유.
+    buffer>0이면 '버퍼 밴드': MA×(1+buffer) 상향 돌파 시 진입, MA×(1-buffer) 하향 이탈 시 청산.
+    MA 근처에서의 잦은 매매(휩쏘)를 줄여 거래수↓·수익↑·낙폭↓ 효과."""
+    ma = df["Close"].rolling(window).mean()
+    if buffer <= 0:
+        return (df["Close"] > ma).astype(float)
+    c = df["Close"].to_numpy()
+    m = ma.to_numpy()
+    pos = np.zeros(len(c))
+    s = 0
+    for i in range(len(c)):
+        if np.isnan(m[i]):
+            pos[i] = s
+            continue
+        if s == 0 and c[i] > m[i] * (1 + buffer):
+            s = 1
+        elif s == 1 and c[i] < m[i] * (1 - buffer):
+            s = 0
+        pos[i] = s
+    return pd.Series(pos, index=df.index)
 
 
 def signal_rsi(df, period, ma_period, oversold, overbought):
@@ -147,7 +166,7 @@ def build_position(df, spec):
     if t == "SMA교차":
         return signal_sma_crossover(df, spec["short"], spec["long"])
     if t == "추세추종(MA)":
-        return signal_sma_price(df, spec["window"])
+        return signal_sma_price(df, spec["window"], spec.get("buffer", 0.0))
     if t == "RSI":
         return signal_rsi(df, spec["period"], spec["ma_period"], spec["oversold"], spec["overbought"])
     if t == "돌파+트레일":
@@ -163,7 +182,8 @@ def spec_label(spec):
     if t == "SMA교차":
         return f"SMA교차(단기{spec['short']}/장기{spec['long']})"
     if t == "추세추종(MA)":
-        return f"추세추종(MA{spec['window']})"
+        b = spec.get("buffer", 0.0)
+        return f"추세추종(MA{spec['window']}" + (f", 버퍼{b*100:g}%)" if b > 0 else ")")
     if t == "RSI":
         return f"RSI({spec['period']},MA{spec['ma_period']},{spec['oversold']}/{spec['overbought']})"
     if t == "돌파+트레일":
@@ -227,8 +247,11 @@ def strategy_grid():
             specs.append({"type": "돌파+트레일", "donchian_n": dn, "atr_n": 14, "atr_k": k})
             specs.append({"type": "돌파+트레일", "donchian_n": dn, "atr_n": 14, "atr_k": k,
                           "use_adx": True, "adx_min": 20})
-    for w in (20, 50, 100, 200):
+    for w in (100, 150, 200, 250):
         specs.append({"type": "추세추종(MA)", "window": w})
+    for w in (150, 200, 250):           # 버퍼 밴드 버전(휩쏘 감소)
+        for b in (0.03, 0.05):
+            specs.append({"type": "추세추종(MA)", "window": w, "buffer": b})
     for s in (10, 20, 30):
         for l in (50, 100, 200):
             specs.append({"type": "SMA교차", "short": s, "long": l})
