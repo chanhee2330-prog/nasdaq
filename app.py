@@ -68,15 +68,21 @@ def load_data(ticker: str, interval: str, period: str) -> pd.DataFrame:
 # 사이드바
 # ----------------------------------------------------------------------------
 st.sidebar.header("⚙️ 설정")
-mode = st.sidebar.radio("모드", ["🔍 전략 자동 탐색", "🔬 워크포워드 검증", "📊 단일 전략 백테스트"])
+mode = st.sidebar.radio(
+    "모드", ["📊 단일 전략 백테스트", "🔍 전략 자동 탐색", "🔬 워크포워드 검증"],
+    index=0,
+    help="단일 전략 = 전략 하나를 자세히 보기 / 자동 탐색 = 여러 전략 순위 / 워크포워드 = 과최적화 배제 검증",
+)
 
 st.sidebar.markdown("**종목**")
-sig_label = st.sidebar.selectbox("신호 종목 (추세 판단)", list(SIGNAL_TICKERS.keys()), index=0)
+sig_label = st.sidebar.selectbox("신호 종목 (추세 판단)", list(SIGNAL_TICKERS.keys()), index=1,
+                                 help="매수/매도 '신호'를 만드는 기준 종목. 덜 흔들리는 기초자산(지수)을 권장.")
 signal_ticker = SIGNAL_TICKERS[sig_label]
 if signal_ticker == "__custom__":
     signal_ticker = st.sidebar.text_input("신호 티커", value="NQ=F").strip().upper()
 
-trd_label = st.sidebar.selectbox("거래 종목 (실제 매매)", list(TRADE_TICKERS.keys()), index=0)
+trd_label = st.sidebar.selectbox("거래 종목 (실제 매매)", list(TRADE_TICKERS.keys()), index=1,
+                                 help="실제로 사고파는 종목. 손익은 이 종목 가격으로 계산됨(SOXL=반도체 3배).")
 trade_ticker = TRADE_TICKERS[trd_label]
 synth_mult = None
 if trade_ticker == "__synth__":
@@ -96,8 +102,12 @@ fee_bps = st.sidebar.number_input("매매 수수료 (bp)", 0.0, 100.0, 5.0, 1.0)
 single_strategy, sp, sort_key = None, {}, "CAGR"
 if mode == "📊 단일 전략 백테스트":
     single_strategy = st.sidebar.selectbox(
-        "전략", ["돌파+트레일 (추천)", "추세추종 (MA)", "이동평균 교차 (SMA)", "RSI", "매수 후 보유"])
-    if single_strategy == "돌파+트레일 (추천)":
+        "전략", ["추세추종 (MA) ⭐추천", "돌파+트레일", "이동평균 교차 (SMA)", "RSI", "매수 후 보유"],
+        help="여러 전략을 검증한 결과, 단순 '추세추종(장기 이동평균)'이 가장 안정적으로 우수했습니다.")
+    if single_strategy == "추세추종 (MA) ⭐추천":
+        sp["window"] = st.sidebar.slider("이동평균 기간 (일)", 3, 250, 200,
+                                         help="종가가 이 기간의 이동평균선 '위'면 보유, '아래'면 현금. 200 권장.")
+    elif single_strategy == "돌파+트레일":
         sp["donchian_n"] = st.sidebar.slider("돈치안 돌파 기간(진입)", 5, 100, 20)
         sp["atr_n"] = st.sidebar.slider("ATR 기간", 5, 30, 14)
         sp["atr_k"] = st.sidebar.slider("ATR 트레일링 배수(클수록 길게 보유)", 1.0, 6.0, 3.0, 0.5)
@@ -108,8 +118,6 @@ if mode == "📊 단일 전략 백테스트":
         if sp["use_disp"]:
             sp["disp_cap"] = st.sidebar.slider("이격도 상한(이 위면 진입 금지)", 101, 140, 115)
             sp["disp_n"] = st.sidebar.slider("이격도 이동평균 기간", 5, 60, 20)
-    elif single_strategy == "추세추종 (MA)":
-        sp["window"] = st.sidebar.slider("이동평균 기간", 3, 200, 50)
     elif single_strategy == "이동평균 교차 (SMA)":
         sp["short"] = st.sidebar.slider("단기", 3, 100, 20)
         sp["long"] = st.sidebar.slider("장기", 10, 300, 100)
@@ -131,13 +139,52 @@ run = st.sidebar.button("▶ 실행", type="primary", use_container_width=True)
 # ----------------------------------------------------------------------------
 # 메인
 # ----------------------------------------------------------------------------
-st.title("📈 나스닥/SOXL 백테스팅")
-st.caption("신호는 기초자산(NQ=F·SOXX 등)으로 만들고, 손익은 거래 종목(SOXL 등)으로 계산합니다. "
-           "교육·연구용이며 투자 권유가 아닙니다. ⚠️ 레버리지 ETF는 횡보·하락장에서 가치가 크게 감소합니다.")
+st.title("📈 나스닥 → SOXL 추세추종 백테스팅")
+st.caption("반도체 지수(SOXX) 추세로 신호를 만들어 SOXL(반도체 3배 레버리지)을 매매하는 전략을 "
+           "과거 데이터로 검증합니다. 교육·연구용이며 투자 권유가 아닙니다.")
+
+with st.expander("📖 처음이신가요? — 이 앱과 기본값 설명 (클릭해서 펼치기)", expanded=not run):
+    st.markdown(
+        """
+### 이 앱이 하는 일
+**백테스트** = "이 매매 규칙을 과거에 그대로 따랐다면 결과가 어땠을까?"를 실제 데이터로 계산해 보는 것입니다.
+그냥 사서 들고 있는 것(**매수 후 보유**)과 비교해, 규칙 매매가 더 나은지 확인합니다.
+
+### 🟢 기본값(추천 설정) — 그대로 ▶ 실행만 눌러도 됩니다
+| 항목 | 기본값 | 뜻 |
+|---|---|---|
+| 모드 | **단일 전략 백테스트** | 전략 하나를 자세히 보기 |
+| 신호 종목 | **SOXX** (반도체 지수) | 매수/매도 *신호*를 만드는 기준 (덜 흔들리는 지수) |
+| 거래 종목 | **SOXL** (반도체 3배) | 실제로 사고파는 종목 (손익 계산 대상) |
+| 봉 기준 | **일봉 · 전체기간** | 하루 단위, 데이터가 있는 처음부터 끝까지 |
+| 전략 | **추세추종(MA) 200** ⭐ | 아래 설명 참고 |
+
+### ⭐ 추천 전략: 추세추종 (200일 이동평균)
+> **규칙**: 신호 종목의 종가가 **200일 이동평균선 위에 있으면 SOXL 보유(매수), 아래로 내려가면 전량 매도(현금)**.
+
+왜 이게 추천일까요? 여러 전략(RSI·돌파·채널·숏 등)을 다 검증해 봤지만, **이 단순한 규칙이 가장 꾸준히 좋았습니다.**
+- 레버리지 ETF(SOXL 등)는 **큰 폭락 한 번에 -90~-100%로 거의 청산**됩니다(회복 불가).
+- 추세추종은 **하락 추세가 시작되면 현금으로 빠져 폭락을 피하므로**, 길게 보면 그냥 들고 있는 것보다 훨씬 유리합니다.
+- 단, **강한 급등장에서는 그냥 보유가 더 나을 수 있습니다** (잠깐 쉬는 사이 급등을 놓침). 이건 전략의 약점이 아니라 트레이드오프입니다.
+
+### 📊 결과 숫자 읽는 법
+- **총수익률**: 기간 전체 누적 수익 (예: +500% = 6배)
+- **CAGR**: 연평균 복리 수익률 (매년 평균 몇 % 불었나)
+- **MDD(최대 낙폭)**: 고점 대비 최대 하락폭 — **작을수록(0에 가까울수록) 안전**. 레버리지 보유는 보통 -80~-100%
+- **샤프 지수**: 위험 대비 효율 — 높을수록 좋음 (1 이상이면 양호)
+- 차트의 ▲초록=매수 시점, ▼빨강=매도 시점. 아래 곡선은 전략(초록) vs 보유(회색 점선) 자산 변화.
+
+### 🧪 더 해보기
+- **거래 종목 → "합성 레버리지"**: SOXL이 없던 옛날(닷컴·금융위기)까지 "그때 3배 들고 있었다면?"을 봅니다.
+- **모드 → 자동 탐색 / 워크포워드**: 여러 전략 순위 비교 / 과최적화를 걸러낸 '진짜' 성과 검증.
+
+> ⚠️ **주의**: 과거 성과가 미래를 보장하지 않습니다. 레버리지 ETF는 매우 위험합니다. 이 도구는 교육·연구용이며 투자 권유가 아닙니다.
+        """
+    )
 
 if not run:
-    st.info("왼쪽에서 신호 종목·거래 종목·봉 기준을 고른 뒤 **실행**을 눌러주세요. "
-            "기본값은 'NQ=F 신호 → SOXL 거래 · 일봉 전체기간 · 전략 자동 탐색' 입니다.")
+    st.info("👈 왼쪽 사이드바에서 **▶ 실행** 버튼을 누르면 시작합니다. "
+            "기본값(SOXX 신호 → SOXL · 일봉 전체 · 추세추종 200)이 추천 설정이라 그대로 눌러도 됩니다.")
     st.stop()
 
 spin = st.spinner("데이터 불러오는 중...")
@@ -305,8 +352,8 @@ if single_strategy == "RSI" and sp["oversold"] >= sp["overbought"]:
     st.stop()
 
 spec_map = {
-    "돌파+트레일 (추천)": {"type": "돌파+트레일", "atr_n": sp.get("atr_n", 14), **sp},
-    "추세추종 (MA)": {"type": "추세추종(MA)", **sp},
+    "추세추종 (MA) ⭐추천": {"type": "추세추종(MA)", **sp},
+    "돌파+트레일": {"type": "돌파+트레일", "atr_n": sp.get("atr_n", 14), **sp},
     "이동평균 교차 (SMA)": {"type": "SMA교차", **sp},
     "RSI": {"type": "RSI", **sp},
     "매수 후 보유": {"type": "BH"},
