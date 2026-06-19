@@ -121,9 +121,11 @@ def signal_rsi(df, period, ma_period, oversold, overbought):
 
 def signal_breakout_trail(df, donchian_n, atr_n, atr_k,
                           use_adx=False, adx_min=20, use_disp=False,
-                          disp_cap=115, disp_n=20):
+                          disp_cap=115, disp_n=20, cooldown=0):
     """돈치안 돌파 진입 + ATR 트레일링 스톱 청산 (+ADX/이격도 진입 필터).
-    오르는 동안은 계속 보유하고, 고점 대비 ATR×k 만큼 밀릴 때만 청산."""
+    오르는 동안은 계속 보유하고, 고점 대비 ATR×k 만큼 밀릴 때만 청산.
+    - use_disp: 이격도(현재가/MA×100)가 disp_cap 초과면 '이미 많이 오른 과열' → 신규 매수 금지.
+    - cooldown: 청산 후 이 봉 수 동안 재매수 금지 → 고점 근처 반복 진입(churn) 억제."""
     upper = df["High"].rolling(donchian_n).max().shift(1)  # 직전 N봉 고가
     a = atr(df, atr_n)
     adx_v = adx(df) if use_adx else None
@@ -139,13 +141,17 @@ def signal_breakout_trail(df, donchian_n, atr_n, atr_k,
     pos = np.zeros(n)
     in_pos = False
     peak = 0.0
+    cd = 0
     for i in range(n):
         if not in_pos:
+            if cd > 0:                         # 쿨다운: 재진입 대기
+                cd -= 1
+                continue
             enter = (not np.isnan(up[i])) and c[i] > up[i] and not np.isnan(av[i])
             if enter and use_adx and (np.isnan(adxv[i]) or adxv[i] < adx_min):
                 enter = False
             if enter and use_disp and (not np.isnan(dv[i]) and dv[i] > disp_cap):
-                enter = False
+                enter = False                  # 과열(많이 오른) 구간 매수 금지
             if enter:
                 in_pos = True
                 peak = c[i]
@@ -156,13 +162,174 @@ def signal_breakout_trail(df, donchian_n, atr_n, atr_k,
             if c[i] < stop:
                 in_pos = False
                 pos[i] = 0.0
+                cd = cooldown                  # 청산 후 쿨다운 시작
             else:
                 pos[i] = 1.0
     return pd.Series(pos, index=df.index)
 
 
+def signal_swing(df, ma_n=20, band_pct=0.05, trend_n=100, use_trend=True, max_hold=10):
+    """스윙(눌림목 반등) 매매.
+    - (선택) 상승추세 필터: 종가 > 장기MA(trend_n) 일 때만 진입.
+    - 진입: 종가가 중심MA(ma_n)의 하단밴드(MA×(1-band_pct)) 이하로 눌릴 때(과매도 눌림목) 매수.
+    - 청산: 종가가 중심MA 회복 또는 상단밴드 도달, 또는 max_hold봉 경과 → 매도.
+    짧게 사고 짧게 파는 단기 스윙 → 보유기간이 추세추종보다 훨씬 짧다."""
+    close = df["Close"]
+    ma = close.rolling(ma_n).mean()
+    trend = close.rolling(trend_n).mean()
+    c = close.to_numpy()
+    m = ma.to_numpy()
+    tr = trend.to_numpy()
+    n = len(c)
+    pos = np.zeros(n)
+    in_pos, held = False, 0
+    for i in range(n):
+        if np.isnan(m[i]):
+            pos[i] = 0.0
+            continue
+        lo = m[i] * (1 - band_pct)
+        up = m[i] * (1 + band_pct)
+        if not in_pos:
+            up_ok = (not use_trend) or (not np.isnan(tr[i]) and c[i] > tr[i])
+            if up_ok and c[i] <= lo:
+                in_pos, held = True, 0
+                pos[i] = 1.0
+        else:
+            held += 1
+            if c[i] >= m[i] or c[i] >= up or held >= max_hold:
+                in_pos = False
+                pos[i] = 0.0
+            else:
+                pos[i] = 1.0
+    return pd.Series(pos, index=df.index)
+
+
+def signal_trendline_breakout(df, k=10, atr_n=14, atr_k=3.0):
+    """하락 추세선(낮아지는 고점들을 이은 저항선) 상향 돌파 매수 + ATR 트레일링 청산.
+    - 좌우 k봉 안에서 최고가인 '스윙 고점'을 인과적으로 확정(미래 정보 X).
+    - 최근의 '낮아지는 고점' 두 개로 하락 저항선을 긋고, 종가가 그 위로 뚫으면 매수.
+    - 청산: 고점 대비 ATR×k 트레일링 스톱."""
+    high = df["High"].to_numpy()
+    close = df["Close"].to_numpy()
+    av = atr(df, atr_n).to_numpy()
+    n = len(close)
+    pos = np.zeros(n)
+    pivots = []          # 확정된 스윙 고점 [(idx, high)]
+    in_pos = False
+    peak = 0.0
+    prev_res = None
+    for i in range(n):
+        j = i - k                                   # k봉 전 후보
+        if j - k >= 0 and high[j] == high[j - k:j + k + 1].max():
+            if not pivots or pivots[-1][0] != j:
+                pivots.append((j, high[j]))
+        # 최근 '낮아지는 고점' 두 개로 저항선 값 계산
+        res = None
+        for q in range(len(pivots) - 1, 0, -1):
+            a0, h0 = pivots[q - 1]
+            a1, h1 = pivots[q]
+            if h1 < h0:
+                res = h1 + (h1 - h0) / (a1 - a0) * (i - a1)
+                break
+        if not in_pos:
+            if (res is not None and prev_res is not None and not np.isnan(av[i])
+                    and close[i] > res and close[i - 1] <= prev_res):     # 저항선 상향 돌파
+                in_pos = True
+                peak = close[i]
+                pos[i] = 1.0
+        else:
+            peak = max(peak, close[i])
+            stop = peak - atr_k * av[i] if not np.isnan(av[i]) else -np.inf
+            if close[i] < stop:
+                in_pos = False
+                pos[i] = 0.0
+            else:
+                pos[i] = 1.0
+        prev_res = res
+    return pd.Series(pos, index=df.index)
+
+
+def signal_rsi_channel(df, period=14, oversold=30, overbought=70, ob_persist=0):
+    """RSI 채널 매매 (사용자 노하우).
+    - 매수: RSI가 '극히 낮음(과매도)'에서 위로 방향을 바꿀 때(저점 확인) → 채널 바닥 매수.
+    - 매도: RSI가 '높음(과매수)'에서 아래로 방향을 바꿀 때 → 매도.
+      단, ob_persist>0 이면 'RSI가 과매수에 최소 그만큼(봉) 머문 뒤' 꺾일 때만 매도.
+      → 짧게 튄 과매수 스파이크는 무시하고(강한 추세는 계속 보유), 오래 높던 RSI가
+        꺾일 때(천장 형성)만 판다. '얼마나 오래 높았나'를 반영.
+    RSI 저점/고점의 방향전환을 신호로 쓴다(미래 정보 사용 안 함)."""
+    rsi = compute_rsi(df["Close"], period).to_numpy()
+    n = len(rsi)
+    pos = np.zeros(n)
+    in_pos = False
+    hi = 0  # 연속으로 과매수(>=overbought)에 머문 봉 수
+    for i in range(1, n):
+        r, rp = rsi[i], rsi[i - 1]
+        if np.isnan(r) or np.isnan(rp):
+            pos[i] = 1.0 if in_pos else 0.0
+            continue
+        crossed_down = rp >= overbought > r        # 과매수에서 아래로 꺾임
+        if not in_pos and rp <= oversold < r:      # 과매도 탈출(저점 방향전환)
+            in_pos = True
+        elif in_pos and crossed_down and hi >= ob_persist:  # 충분히 오래 높았다가 꺾임
+            in_pos = False
+        hi = hi + 1 if r >= overbought else 0       # 결정 후 갱신(꺾인 봉은 0으로 리셋)
+        pos[i] = 1.0 if in_pos else 0.0
+    return pd.Series(pos, index=df.index)
+
+
+def signal_crash_recovery(df, ma_n=50, dip=0.15, pop=0.15, use_trend=False,
+                          trend_n=200, max_hold=0):
+    """폭락 매수 + 급등 빠른 청산 (비대칭 역추세).
+    - 진입: 종가가 중심MA(ma_n)보다 dip(예 15%) 이상 아래로 '폭락'하면 매수.
+    - 보유: 회복하는 동안 길게 보유(인내) — 중간 손절 없음.
+    - 청산: 종가가 중심MA보다 pop(예 15%) 이상 위로 '급등(과열)'하면 즉시 청산(빠른 익절).
+    - use_trend: 장기MA 위(상승추세)에서의 폭락만 매수(추세 안에서의 눌림목만).
+    - max_hold>0: 안전장치로 최대 보유 봉 제한(0=무제한).
+    V자 반등 종목(레버리지 ETF 등)에 적합. 단, '길게 보유'는 추가 하락 위험을 감수한다."""
+    close = df["Close"]
+    ma = close.rolling(ma_n).mean()
+    trend = close.rolling(trend_n).mean()
+    c = close.to_numpy()
+    m = ma.to_numpy()
+    tr = trend.to_numpy()
+    n = len(c)
+    pos = np.zeros(n)
+    in_pos, held = False, 0
+    for i in range(n):
+        if np.isnan(m[i]):
+            pos[i] = 0.0
+            continue
+        if not in_pos:
+            ok = (not use_trend) or (not np.isnan(tr[i]) and c[i] > tr[i])
+            if ok and c[i] <= m[i] * (1 - dip):       # 폭락 → 매수
+                in_pos, held = True, 0
+                pos[i] = 1.0
+        else:
+            held += 1
+            if c[i] >= m[i] * (1 + pop) or (max_hold and held >= max_hold):  # 급등 → 빠른 청산
+                in_pos = False
+                pos[i] = 0.0
+            else:
+                pos[i] = 1.0                            # 회복까지 길게 보유
+    return pd.Series(pos, index=df.index)
+
+
 def build_position(df, spec):
     t = spec["type"]
+    if t == "하락추세선돌파":
+        return signal_trendline_breakout(df, spec.get("k", 10), spec.get("atr_n", 14),
+                                        spec.get("atr_k", 3.0))
+    if t == "RSI채널":
+        return signal_rsi_channel(df, spec.get("period", 14), spec.get("oversold", 30),
+                                 spec.get("overbought", 70), spec.get("ob_persist", 0))
+    if t == "폭락매수+급등청산":
+        return signal_crash_recovery(df, spec.get("ma_n", 50), spec.get("dip", 0.15),
+                                     spec.get("pop", 0.15), spec.get("use_trend", False),
+                                     spec.get("trend_n", 200), spec.get("max_hold", 0))
+    if t == "스윙(밴드)":
+        return signal_swing(df, spec.get("ma_n", 20), spec.get("band_pct", 0.05),
+                            spec.get("trend_n", 100), spec.get("use_trend", True),
+                            spec.get("max_hold", 10))
     if t == "SMA교차":
         return signal_sma_crossover(df, spec["short"], spec["long"])
     if t == "추세추종(MA)":
@@ -173,12 +340,48 @@ def build_position(df, spec):
         return signal_breakout_trail(
             df, spec["donchian_n"], spec["atr_n"], spec["atr_k"],
             spec.get("use_adx", False), spec.get("adx_min", 20),
-            spec.get("use_disp", False), spec.get("disp_cap", 115), spec.get("disp_n", 20))
+            spec.get("use_disp", False), spec.get("disp_cap", 115), spec.get("disp_n", 20),
+            spec.get("cooldown", 0))
     return signal_buy_and_hold(df)
+
+
+def long_short_position(pos_long, max_short_bars, short_size=1.0):
+    """롱(1)/현금(0) 포지션을 롱/숏 포지션으로 변환.
+    매도 신호로 현금이 되는 구간의 '앞부분 max_short_bars 봉'만 숏(-short_size)으로 잡고,
+    그 뒤로는 현금(0). → 숏은 롱보다 항상 '짧게'만 보유한다.
+    백테스트 수익은 run_backtest가 음수 포지션을 그대로 처리(가격 하락 시 이익)."""
+    p = pos_long.to_numpy()
+    out = p.astype(float).copy()
+    n, i = len(p), 0
+    while i < n:
+        if p[i] <= 0:                         # 현금(또는 비롱) 구간
+            j = i
+            while j < n and p[j] <= 0:
+                j += 1
+            end = min(i + int(max_short_bars), j)
+            out[i:end] = -float(short_size)   # 앞부분만 숏
+            out[end:j] = 0.0                  # 나머지는 현금
+            i = j
+        else:
+            i += 1
+    return pd.Series(out, index=pos_long.index)
 
 
 def spec_label(spec):
     t = spec["type"]
+    if t == "하락추세선돌파":
+        return f"하락추세선돌파(스윙{spec.get('k', 10)}, ATR{spec.get('atr_n', 14)}×{spec.get('atr_k', 3.0)})"
+    if t == "RSI채널":
+        p = f", 과매수{spec['ob_persist']}봉↑" if spec.get("ob_persist", 0) else ""
+        return f"RSI채널({spec.get('period', 14)}, 과매도{spec.get('oversold', 30)}/과매수{spec.get('overbought', 70)}{p})"
+    if t == "폭락매수+급등청산":
+        tf = ", 추세필터" if spec.get("use_trend") else ""
+        return (f"폭락매수(MA{spec.get('ma_n', 50)}, 폭락-{spec.get('dip', 0.15) * 100:g}%/"
+                f"급등+{spec.get('pop', 0.15) * 100:g}%{tf})")
+    if t == "스윙(밴드)":
+        flt = ", 추세필터" if spec.get("use_trend", True) else ""
+        return (f"스윙(MA{spec.get('ma_n', 20)}±{spec.get('band_pct', 0.05) * 100:g}%, "
+                f"최대{spec.get('max_hold', 10)}봉{flt})")
     if t == "SMA교차":
         return f"SMA교차(단기{spec['short']}/장기{spec['long']})"
     if t == "추세추종(MA)":
@@ -192,6 +395,8 @@ def spec_label(spec):
             flt.append(f"ADX≥{spec['adx_min']}")
         if spec.get("use_disp"):
             flt.append(f"이격도≤{spec['disp_cap']}")
+        if spec.get("cooldown", 0):
+            flt.append(f"쿨다운{spec['cooldown']}")
         ftxt = (" +" + "/".join(flt)) if flt else ""
         return f"돌파{spec['donchian_n']}+트레일(ATR{spec['atr_n']}×{spec['atr_k']}){ftxt}"
     return "매수 후 보유"
@@ -257,6 +462,11 @@ def strategy_grid():
             specs.append({"type": "SMA교차", "short": s, "long": l})
     for (p, m, ov, ob) in [(14, 9, 30, 70), (14, 5, 35, 65)]:
         specs.append({"type": "RSI", "period": p, "ma_period": m, "oversold": ov, "overbought": ob})
+    for ma_n in (10, 20):                      # 스윙(눌림목) 변형들
+        for band in (0.04, 0.07):
+            for mh in (5, 10):
+                specs.append({"type": "스윙(밴드)", "ma_n": ma_n, "band_pct": band,
+                              "trend_n": 100, "use_trend": True, "max_hold": mh})
     return specs
 
 
