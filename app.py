@@ -31,7 +31,8 @@ def _yf_session():
 
 from engine import (
     build_position, compute_metrics, map_position, run_backtest,
-    signal_buy_and_hold, synth_leverage_df, trend_adaptive_lines,
+    signal_buy_and_hold, signal_rsi_channel, signal_trend_adaptive,
+    synth_leverage_df, trend_adaptive_lines,
 )
 
 st.set_page_config(page_title="SOXL 추세추종 신호기", page_icon="📈", layout="wide")
@@ -61,6 +62,34 @@ def load_data(ticker: str) -> pd.DataFrame:
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
     df.index = pd.to_datetime(df.index)
     return df
+
+
+def _memo_rsi_trend(df):
+    """메모(영상) 전략: RSI 과매도/과매수 채널 + 200일선 위에서만 보유(롱only)."""
+    rsi_pos = signal_rsi_channel(df, period=14, oversold=30, overbought=70)
+    ma200 = df["Close"].rolling(200).mean()
+    return rsi_pos.astype(float) * (df["Close"] > ma200).astype(float)
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def compare_strategies(df, fee_bps, my_spec):
+    """같은 종목·기간·수수료로 내 전략 vs 메모 RSI 전략 vs 보유를 비교.
+    반환: (지표표 DataFrame, {전략명: 자산곡선 Series})."""
+    items = [
+        ("① 정밀추세 (내 전략)", build_position(df, my_spec), fee_bps),
+        ("② 단순 RSI 30/70", signal_rsi_channel(df, 14, 30, 70), fee_bps),
+        ("③ RSI+200MA 롱only (메모)", _memo_rsi_trend(df), fee_bps),
+        ("④ 그냥 보유", signal_buy_and_hold(df), 0.0),
+    ]
+    rows, curves = [], {}
+    for name, pos, fee in items:
+        res = run_backtest(df, pos, fee)
+        m = compute_metrics(res["StrategyEquity"], res["StrategyReturn"], 252)
+        rows.append({"전략": name, "총수익률": m.get("total_return", 0), "CAGR": m.get("cagr", 0),
+                     "MDD": m.get("max_dd", 0), "샤프": m.get("sharpe", 0),
+                     "거래수": int((res["Trade"] > 0).sum())})
+        curves[name] = res["StrategyEquity"]
+    return pd.DataFrame(rows), curves
 
 
 # ----------------------------------------------------------------------------
@@ -287,6 +316,45 @@ with st.expander("📖 이 전략 규칙 & 주의 (클릭)"):
 - 합성·과거 기준이라 실전(차입비용·슬리피지)은 더 나쁠 수 있습니다. 과거 성과가 미래를 보장하지 않습니다. 투자 권유 아님.
         """
     )
+
+# ----------------------------------------------------------------------------
+# 🆚 전략 비교 (내 추세추종 vs 메모의 RSI 전략 vs 보유)
+# ----------------------------------------------------------------------------
+st.subheader("🆚 전략 비교 — 데이터로 직접 검증")
+st.caption("같은 종목·기간·수수료로 **① 내 정밀추세 · ② 단순 RSI30/70 · ③ RSI+200MA 롱only(영상 메모 전략) · "
+           "④ 그냥 보유** 를 비교합니다. ‘좋아 보이는 전략’이 정말 보유를 이기는지 직접 확인하세요.")
+
+# 합성(H=L=C)은 ATR·RSI가 degenerate → 실제 OHLC가 있는 신호 종목으로 비교
+if trade_code == "__synth__":
+    comp_df, comp_name = signal_df, f"{signal_ticker}(합성 대신 실제가)"
+else:
+    comp_df, comp_name = trade_df, trade_name
+
+if st.checkbox("전략 비교 실행 (계산 잠시)", value=False):
+    if len(comp_df) < 250:
+        st.warning("비교에는 최소 250봉 이상 데이터가 필요합니다.")
+    else:
+        cmp_tbl, curves = compare_strategies(comp_df, fee_bps, spec)
+        fmt = cmp_tbl.copy()
+        for c in ("총수익률", "CAGR", "MDD"):
+            fmt[c] = fmt[c].map(lambda v: f"{v*100:,.0f}%" if abs(v) >= 1 else f"{v*100:,.1f}%")
+        fmt["샤프"] = fmt["샤프"].map(lambda v: f"{v:,.2f}")
+        st.dataframe(fmt, use_container_width=True, hide_index=True)
+
+        cfig = go.Figure()
+        colors = {"① 정밀추세 (내 전략)": "#2ca02c", "② 단순 RSI 30/70": "#ff9800",
+                  "③ RSI+200MA 롱only (메모)": "#1f77b4", "④ 그냥 보유": "#999999"}
+        for name, eq in curves.items():
+            cfig.add_trace(go.Scattergl(x=eq.index, y=eq, name=name,
+                                        line=dict(color=colors.get(name), width=1.6)))
+        cfig.update_yaxes(type="log", title_text="자산(시작=1)")
+        cfig.update_layout(height=420, hovermode="x", legend=dict(orientation="h"),
+                           margin=dict(t=10, b=10, l=10, r=10),
+                           title=f"{comp_name} — 전략별 자산곡선 (로그)")
+        st.plotly_chart(cfig, use_container_width=True, config=CHART_CONFIG)
+        st.caption(f"대상: {comp_name} · {comp_df.index[0].date()}~{comp_df.index[-1].date()} · "
+                   f"수수료 {fee_bps:g}bp. ⚠️ 무료 데이터는 **일봉** 기준 — RSI 평균회귀는 1시간봉에서 더 유리할 수 있어 "
+                   f"메모(③) 결과가 과소평가될 수 있습니다. 단, ③의 **낮은 낙폭(MDD)** 경향은 일봉에서도 확인됩니다.")
 
 csv = result.round(4).to_csv().encode("utf-8-sig")
 st.download_button("⬇ 백테스트 결과 CSV", csv, file_name=f"{trade_name}_trend.csv", mime="text/csv")
