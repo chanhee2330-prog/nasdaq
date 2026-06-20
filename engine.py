@@ -314,8 +314,83 @@ def signal_crash_recovery(df, ma_n=50, dip=0.15, pop=0.15, use_trend=False,
     return pd.Series(pos, index=df.index)
 
 
+def _ma(close: pd.Series, n: int, ema: bool = False) -> pd.Series:
+    """SMA 또는 EMA. EMA는 최근 가격에 민감 → 폭락을 몇 봉 더 일찍 감지."""
+    return close.ewm(span=n, min_periods=n).mean() if ema else close.rolling(n).mean()
+
+
+def trend_adaptive_lines(df, window, ema=False, atr_n=14, k_enter=0.5, k_exit=1.5):
+    """정밀 추세추종의 진입선/청산선(변동성 적응형).
+    - 진입선 = MA + k_enter×ATR  (이 위로 강하게 올라설 때만 신규 진입)
+    - 청산선 = MA − k_exit×ATR    (변동성↑ → 밴드 자동 확대 → 평소 출렁임에 안 털림)
+    app(차트)·신호 로직이 같은 선을 쓰도록 한곳에서 계산한다."""
+    ma = _ma(df["Close"], window, ema)
+    a = atr(df, atr_n)
+    return ma, ma + k_enter * a, ma - k_exit * a
+
+
+def signal_trend_adaptive(df, window=150, ema=False, atr_n=14, k_enter=0.5, k_exit=1.5,
+                          confirm_bars=2, slope_n=10, cooldown=3):
+    """정밀 추세추종 — '진짜 폭락 vs 가짜하락'을 3가지 근거로 판별해 단계적(1.0/0.5/0.0) 대응.
+    레버리지로 추세를 길게 타되, 큰 폭락만 정확히 회피하는 게 목표.
+
+    가짜하락 필터:
+      1) 변동성 적응 밴드: 청산선=MA−k_exit×ATR → 변동성 큰 장에선 밴드가 넓어져 평소 출렁임에 안 털림.
+      2) 지속 확인(confirm_bars): 청산선을 'N봉 연속' 깨야 진짜로 인정 → 하루짜리 가짜하락 무시.
+      3) MA 기울기 게이트: MA가 아직 상승 중이면 그 밑 하락은 '눌림(가짜)' → 절반만 축소(0.5),
+         MA가 꺾였으면 '추세붕괴(진짜)' → 전량 청산(0.0)으로 즉시 대응.
+
+    비중 사다리:
+      - 1.0(풀): 종가 ≥ MA (건강한 추세)
+      - 0.5(축소): MA 아래~청산선 사이, 또는 청산선 하향이나 아직 '가짜' 의심 단계
+      - 0.0(현금): 청산선을 confirm_bars 연속 깨거나(지속) MA가 꺾였을 때(진짜 붕괴)
+    진입: 종가 > 진입선 + MA 상승 중. 청산 뒤 cooldown봉은 재진입 금지(churn 억제)."""
+    ma, entry, exitl = trend_adaptive_lines(df, window, ema, atr_n, k_enter, k_exit)
+    c = df["Close"].to_numpy()
+    m = ma.to_numpy()
+    el = entry.to_numpy()
+    xl = exitl.to_numpy()
+    n = len(c)
+    pos = np.zeros(n)
+    cur = 0.0
+    below = 0   # 청산선 아래 연속 봉 수
+    cd = 0      # 재진입 쿨다운
+    for i in range(n):
+        if np.isnan(m[i]) or np.isnan(el[i]) or np.isnan(xl[i]):
+            pos[i] = cur
+            continue
+        slope_up = i >= slope_n and not np.isnan(m[i - slope_n]) and m[i] > m[i - slope_n]
+        if cur <= 0:                                   # 현금 → 진입 판단
+            if cd > 0:
+                cd -= 1
+                pos[i] = 0.0
+                continue
+            if c[i] > el[i] and slope_up:              # 진입선 위 + 추세 상승
+                cur = 1.0
+                below = 0
+        else:                                          # 보유(1.0/0.5) → 청산/축소 판단
+            if c[i] < xl[i]:                           # 청산선 하향
+                below += 1
+                if below >= confirm_bars or not slope_up:   # 지속됨 or MA 꺾임 → 진짜
+                    cur = 0.0
+                    cd = cooldown
+                    below = 0
+                else:                                  # 아직 가짜 의심 → 절반만 축소
+                    cur = 0.5
+            else:                                      # 청산선 위로 회복
+                below = 0
+                cur = 1.0 if c[i] >= m[i] else 0.5     # MA 위=풀 / MA 아래=경계(절반)
+        pos[i] = cur
+    return pd.Series(pos, index=df.index)
+
+
 def build_position(df, spec):
     t = spec["type"]
+    if t == "정밀추세":
+        return signal_trend_adaptive(
+            df, spec.get("window", 150), spec.get("ema", False), spec.get("atr_n", 14),
+            spec.get("k_enter", 0.5), spec.get("k_exit", 1.5),
+            spec.get("confirm_bars", 2), spec.get("slope_n", 10), spec.get("cooldown", 3))
     if t == "하락추세선돌파":
         return signal_trendline_breakout(df, spec.get("k", 10), spec.get("atr_n", 14),
                                         spec.get("atr_k", 3.0))
@@ -369,6 +444,10 @@ def long_short_position(pos_long, max_short_bars, short_size=1.0):
 
 def spec_label(spec):
     t = spec["type"]
+    if t == "정밀추세":
+        ma_kind = "EMA" if spec.get("ema") else "MA"
+        return (f"정밀추세({ma_kind}{spec.get('window', 150)}, 청산−{spec.get('k_exit', 1.5):g}ATR, "
+                f"확인{spec.get('confirm_bars', 2)}봉)")
     if t == "하락추세선돌파":
         return f"하락추세선돌파(스윙{spec.get('k', 10)}, ATR{spec.get('atr_n', 14)}×{spec.get('atr_k', 3.0)})"
     if t == "RSI채널":
@@ -454,6 +533,12 @@ def strategy_grid():
                           "use_adx": True, "adx_min": 20})
     for w in (100, 150, 200, 250):
         specs.append({"type": "추세추종(MA)", "window": w})
+    for w in (150, 200):                 # 정밀추세(변동성적응+지속확인+기울기) 변형
+        for ke in (1.5, 2.5):
+            for ema in (False, True):
+                specs.append({"type": "정밀추세", "window": w, "ema": ema, "atr_n": 14,
+                              "k_enter": 0.5, "k_exit": ke, "confirm_bars": 2,
+                              "slope_n": 10, "cooldown": 3})
     for w in (150, 200, 250):           # 버퍼 밴드 버전(휩쏘 감소)
         for b in (0.03, 0.05):
             specs.append({"type": "추세추종(MA)", "window": w, "buffer": b})
